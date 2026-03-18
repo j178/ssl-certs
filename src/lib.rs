@@ -221,3 +221,136 @@ impl fmt::Display for Error {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs::File;
+    #[cfg(unix)]
+    use std::fs::Permissions;
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn deduplication() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let cert1 = include_str!("../tests/badssl-com-chain.pem");
+        let cert2 = include_str!("../tests/one-existing-ca.pem");
+        let file_path = temp_dir.path().join("ca-certificates.crt");
+        let dir_path = temp_dir.path().to_path_buf();
+
+        {
+            let mut file = File::create(&file_path).unwrap();
+            write!(file, "{}", &cert1).unwrap();
+            write!(file, "{}", &cert2).unwrap();
+        }
+
+        {
+            // Duplicate (already in `file_path`)
+            let mut file = File::create(dir_path.join("71f3bb26.0")).unwrap();
+            write!(file, "{}", &cert1).unwrap();
+        }
+
+        {
+            // Duplicate (already in `file_path`)
+            let mut file = File::create(dir_path.join("912e7cd5.0")).unwrap();
+            write!(file, "{}", &cert2).unwrap();
+        }
+
+        let result = load_certs_from_paths(Some(&file_path), None);
+        assert_eq!(result.certs.len(), 2);
+
+        let result = load_certs_from_paths(None, Some(&dir_path));
+        assert_eq!(result.certs.len(), 2);
+
+        let result = load_certs_from_paths(Some(&file_path), Some(&dir_path));
+        assert_eq!(result.certs.len(), 2);
+    }
+
+    #[test]
+    fn malformed_file_from_env() {
+        // Certificate parser tries to extract certs from file ignoring
+        // invalid sections.
+        let mut result = CertificateResult::default();
+        load_pem_certs(Path::new(file!()), &mut result);
+        assert_eq!(result.certs.len(), 0);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn from_env_missing_file() {
+        let mut result = CertificateResult::default();
+        load_pem_certs(Path::new("no/such/file"), &mut result);
+        match &first_error(&result).kind {
+            ErrorKind::Io { inner, .. } => assert_eq!(inner.kind(), io::ErrorKind::NotFound),
+            _ => panic!("unexpected error {:?}", result.errors),
+        }
+    }
+
+    #[test]
+    fn from_env_missing_dir() {
+        let mut result = CertificateResult::default();
+        load_pem_certs_from_dir(Path::new("no/such/directory"), &mut result);
+        match &first_error(&result).kind {
+            ErrorKind::Io { inner, .. } => assert_eq!(inner.kind(), io::ErrorKind::NotFound),
+            _ => panic!("unexpected error {:?}", result.errors),
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn from_env_with_non_regular_and_empty_file() {
+        let mut result = CertificateResult::default();
+        load_pem_certs(Path::new("/dev/null"), &mut result);
+        assert_eq!(result.certs.len(), 0);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn from_env_bad_dir_perms() {
+        // Create a temp dir that we can't read from.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        fs::set_permissions(temp_dir.path(), Permissions::from_mode(0o000)).unwrap();
+
+        test_cert_paths_bad_perms(None, &[temp_dir.path()]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn from_env_bad_file_perms() {
+        // Create a tmp dir with a file inside that we can't read from.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("unreadable.pem");
+        let cert_file = File::create(&file_path).unwrap();
+        cert_file
+            .set_permissions(Permissions::from_mode(0o000))
+            .unwrap();
+
+        test_cert_paths_bad_perms(Some(&file_path), &[]);
+    }
+
+    #[cfg(unix)]
+    fn test_cert_paths_bad_perms(file: Option<&Path>, dirs: &[&Path]) {
+        let result = load_certs_from_paths_internal(file, dirs);
+
+        if let (None, true) = (file, dirs.is_empty()) {
+            panic!("only one of file or dir should be set");
+        };
+
+        let error = first_error(&result);
+        match &error.kind {
+            ErrorKind::Io { inner, .. } => {
+                assert_eq!(inner.kind(), io::ErrorKind::PermissionDenied);
+                inner
+            }
+            _ => panic!("unexpected error {:?}", result.errors),
+        };
+    }
+
+    fn first_error(result: &CertificateResult) -> &Error {
+        result.errors.first().unwrap()
+    }
+}

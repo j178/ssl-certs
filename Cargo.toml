@@ -11,3 +11,6 @@ homepage = "https://github.com/j178/ssl-certs"
 
 [dependencies]
 pki-types = { package = "rustls-pki-types", version = "1.10", features = ["std"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
